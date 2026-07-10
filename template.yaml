@@ -1,0 +1,382 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: EventDrop — Serverless Event Inbox
+
+Parameters:
+  AllowedOrigin:
+    Type: String
+    Description: Origin allowed to consume the HTTP API
+    Default: "*"
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures:
+      - arm64
+    Timeout: 10
+    MemorySize: 256
+    Tags:
+      project: eventdrop
+
+Resources:
+  # ────────────────────────────────────────────────────────
+  # HTTP API
+  # ────────────────────────────────────────────────────────
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+      Tags:
+        - Key: project
+          Value: eventdrop
+
+  EventDropApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Name: eventdrop-api
+      Description: EventDrop HTTP API
+
+      # Usar el stage especial $default evita agregar /dev o /prod
+      # a la URL del endpoint.
+      StageName: "$default"
+
+      PropagateTags: true
+
+      Tags:
+        project: eventdrop
+
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","path":"$context.path","status":"$context.status","responseLength":"$context.responseLength","integrationError":"$context.integrationErrorMessage"}
+
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref AllowedOrigin
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+          - X-Request-Id
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowCredentials: false
+        MaxAge: 600
+
+  # ────────────────────────────────────────────────────────
+  # DynamoDB
+  # ────────────────────────────────────────────────────────
+
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+      SSESpecification:
+        SSEEnabled: true
+
+      Tags:
+        - Key: project
+          Value: eventdrop
+
+  # ────────────────────────────────────────────────────────
+  # SQS dead-letter queue
+  # ────────────────────────────────────────────────────────
+
+  DLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      # 14 días.
+      MessageRetentionPeriod: 1209600
+
+      SqsManagedSseEnabled: true
+
+      Tags:
+        - Key: project
+          Value: eventdrop
+
+  # ────────────────────────────────────────────────────────
+  # SQS main queue
+  # ────────────────────────────────────────────────────────
+
+  MainQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      # ProcessEventFunction tiene timeout de 30 segundos.
+      # AWS recomienda al menos 6 × 30 = 180 segundos.
+      VisibilityTimeout: 180
+
+      # Cuatro días.
+      MessageRetentionPeriod: 345600
+
+      # Long polling.
+      ReceiveMessageWaitTimeSeconds: 20
+
+      SqsManagedSseEnabled: true
+
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DLQ.Arn
+        maxReceiveCount: 5
+
+      Tags:
+        - Key: project
+          Value: eventdrop
+
+  # ────────────────────────────────────────────────────────
+  # Lambda: POST /events
+  # ────────────────────────────────────────────────────────
+
+  CreateEventFunction:
+    Type: AWS::Serverless::Function
+
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Sourcemap: false
+        Target: es2022
+
+    Properties:
+      Description: Creates an event and sends it for asynchronous processing
+
+      CodeUri: .
+      Handler: src/functions/create-event.handler
+
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref EventsTable
+          MAIN_QUEUE_URL: !Ref MainQueue
+
+      Events:
+        PostEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventDropApi
+            Path: /events
+            Method: POST
+            PayloadFormatVersion: "2.0"
+
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref EventsTable
+
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt MainQueue.QueueName
+
+  # ────────────────────────────────────────────────────────
+  # Lambda: GET /events/{eventId}
+  # ────────────────────────────────────────────────────────
+
+  GetEventFunction:
+    Type: AWS::Serverless::Function
+
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Sourcemap: false
+        Target: es2022
+
+    Properties:
+      Description: Gets an event by ID
+
+      CodeUri: .
+      Handler: src/functions/get-event.handler
+
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref EventsTable
+
+      Events:
+        GetEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventDropApi
+            Path: /events/{eventId}
+            Method: GET
+            PayloadFormatVersion: "2.0"
+
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref EventsTable
+
+  # ────────────────────────────────────────────────────────
+  # Lambda: GET /events
+  # ────────────────────────────────────────────────────────
+
+  ListEventsFunction:
+    Type: AWS::Serverless::Function
+
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Sourcemap: false
+        Target: es2022
+
+    Properties:
+      Description: Lists events using the DynamoDB GSI
+
+      CodeUri: .
+      Handler: src/functions/list-events.handler
+
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref EventsTable
+
+      Events:
+        GetEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventDropApi
+            Path: /events
+            Method: GET
+            PayloadFormatVersion: "2.0"
+
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref EventsTable
+
+  # ────────────────────────────────────────────────────────
+  # Lambda: GET /health
+  # ────────────────────────────────────────────────────────
+
+  HealthFunction:
+    Type: AWS::Serverless::Function
+
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Sourcemap: false
+        Target: es2022
+
+    Properties:
+      Description: EventDrop health endpoint
+
+      CodeUri: .
+      Handler: src/functions/health.handler
+
+      Events:
+        GetHealth:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventDropApi
+            Path: /health
+            Method: GET
+            PayloadFormatVersion: "2.0"
+
+  # ────────────────────────────────────────────────────────
+  # Lambda: SQS consumer
+  # ────────────────────────────────────────────────────────
+
+  ProcessEventFunction:
+    Type: AWS::Serverless::Function
+
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Sourcemap: false
+        Target: es2022
+
+    Properties:
+      Description: Processes events received from the main SQS queue
+
+      CodeUri: .
+      Handler: src/functions/process-event.handler
+
+      # Timeout independiente de las Lambdas HTTP.
+      Timeout: 30
+      MemorySize: 256
+
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref EventsTable
+
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt MainQueue.Arn
+            BatchSize: 5
+            Enabled: true
+
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+            # Control opcional para impedir que un pico de mensajes
+            # consuma demasiada concurrencia.
+            ScalingConfig:
+              MaximumConcurrency: 5
+
+      Policies:
+        # Permite recibir, borrar y modificar la visibilidad
+        # de los mensajes de MainQueue.
+        - SQSPollerPolicy:
+            QueueName: !GetAtt MainQueue.QueueName
+
+        # El consumidor puede consultar el evento actual.
+        - DynamoDBReadPolicy:
+            TableName: !Ref EventsTable
+
+        # El consumidor puede actualizar su estado.
+        - DynamoDBWritePolicy:
+            TableName: !Ref EventsTable
+
+Outputs:
+  ApiEndpoint:
+    Description: EventDrop HTTP API endpoint
+    Value: !Sub >-
+      https://${EventDropApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}
+
+  ApiId:
+    Description: EventDrop HTTP API ID
+    Value: !Ref EventDropApi
+
+  EventsTableName:
+    Description: DynamoDB events table name
+    Value: !Ref EventsTable
+
+  MainQueueUrl:
+    Description: Main SQS queue URL
+    Value: !Ref MainQueue
+
+  MainQueueArn:
+    Description: Main SQS queue ARN
+    Value: !GetAtt MainQueue.Arn
+
+  DeadLetterQueueUrl:
+    Description: Dead-letter queue URL
+    Value: !Ref DLQ
+
+  DeadLetterQueueArn:
+    Description: Dead-letter queue ARN
+    Value: !GetAtt DLQ.Arn
