@@ -187,6 +187,9 @@ Resources:
         - DynamoDBWritePolicy:
             TableName: !Ref EventsTable
 
+        - DynamoDBReadPolicy:
+            TableName: !Ref EventsTable
+
         - SQSSendMessagePolicy:
             QueueName: !GetAtt MainQueue.QueueName
 
