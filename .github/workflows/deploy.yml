@@ -48,6 +48,7 @@ jobs:
           sam deploy \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
+            --resolve-s3 \
             --stack-name eventdrop \
             --region ${{ secrets.AWS_REGION }} \
             --capabilities CAPABILITY_IAM \
